@@ -552,11 +552,6 @@ def download_selected(
 _current_posts = []
 
 
-def _make_checkbox_choices(posts, page: int) -> list:
-    """(unused, kept for compat)"""
-    return []
-
-
 def _build_page_data(posts, page, selected_indices=None):
     """現在ページの画像パスとチェック状態のリストを返す"""
     import tempfile
@@ -768,12 +763,6 @@ def create_ui():
             page_info = gr.Markdown(value="ページ 0 / 0")
             next_page_btn = gr.Button("次ページ ▶", size="sm")
 
-        # --- 選択操作 ---
-        with gr.Row():
-            select_page_btn = gr.Button("✅ このページ全選択", size="sm")
-            deselect_page_btn = gr.Button("❌ このページ全解除", size="sm")
-            select_all_pages_btn = gr.Button("📦 全ページ選択", size="sm")
-            deselect_all_btn = gr.Button("🗑️ 全ページ解除", size="sm")
         selected_info = gr.Markdown(value="選択: 0 / 0 件")
 
         gr.Markdown("---")
@@ -850,73 +839,6 @@ def create_ui():
                 inputs=[cb, selected_state, posts_state, page_state],
                 outputs=[selected_state, selected_info],
             )
-
-        # --- ページ内全選択 / 全解除 ---
-        def select_page(posts_json, selected_json, current_page):
-            selected = set(json.loads(selected_json)) if selected_json else set()
-            posts = json.loads(posts_json) if posts_json else []
-            start = current_page * PREVIEW_PER_PAGE
-            end = min(start + PREVIEW_PER_PAGE, len(posts))
-            for i in range(start, end):
-                selected.add(i)
-            # チェックボックスを全部オン
-            cb_updates = []
-            for j in range(PREVIEW_PER_PAGE):
-                if start + j < len(posts):
-                    cb_updates.append(gr.update(value=True))
-                else:
-                    cb_updates.append(gr.update())
-            info = f"**選択: {len(selected)} / {len(posts)} 件** — ダウンロード可能"
-            return [json.dumps(sorted(selected)), info] + cb_updates
-
-        def deselect_page(posts_json, selected_json, current_page):
-            selected = set(json.loads(selected_json)) if selected_json else set()
-            posts = json.loads(posts_json) if posts_json else []
-            start = current_page * PREVIEW_PER_PAGE
-            end = min(start + PREVIEW_PER_PAGE, len(posts))
-            for i in range(start, end):
-                selected.discard(i)
-            cb_updates = [gr.update(value=False) for _ in range(PREVIEW_PER_PAGE)]
-            info = f"**選択: {len(selected)} / {len(posts)} 件**"
-            if len(selected) > 0:
-                info += " — ダウンロード可能"
-            return [json.dumps(sorted(selected)), info] + cb_updates
-
-        def select_all_pages(posts_json):
-            posts = json.loads(posts_json) if posts_json else []
-            all_indices = list(range(len(posts)))
-            return (
-                json.dumps(all_indices),
-                f"**選択: {len(posts)} / {len(posts)} 件** — ダウンロード可能",
-            )
-
-        def deselect_all_pages(posts_json):
-            total = len(json.loads(posts_json)) if posts_json else 0
-            return json.dumps([]), f"選択: 0 / {total} 件"
-
-        select_page_btn.click(
-            fn=select_page,
-            inputs=[posts_state, selected_state, page_state],
-            outputs=[selected_state, selected_info] + check_slots,
-        )
-
-        deselect_page_btn.click(
-            fn=deselect_page,
-            inputs=[posts_state, selected_state, page_state],
-            outputs=[selected_state, selected_info] + check_slots,
-        )
-
-        select_all_pages_btn.click(
-            fn=select_all_pages,
-            inputs=[posts_state],
-            outputs=[selected_state, selected_info],
-        )
-
-        deselect_all_btn.click(
-            fn=deselect_all_pages,
-            inputs=[posts_state],
-            outputs=[selected_state, selected_info],
-        )
 
         # --- ページナビゲーション ---
         # interleave image_slots and check_slots for outputs
