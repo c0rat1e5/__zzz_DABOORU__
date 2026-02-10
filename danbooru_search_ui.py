@@ -61,6 +61,7 @@ def search_danbooru(
     max_results: int = 100,
     rating_filter: str = "all",
     min_score: int = 0,
+    progress_cb=None,
 ) -> tuple:
     """
     複数タグ検索:
@@ -101,6 +102,11 @@ def search_danbooru(
     fetch_limit = min(fetch_limit, 5000)
 
     while len(all_posts) < fetch_limit:
+        if progress_cb:
+            progress_cb(
+                len(all_posts) / fetch_limit,
+                desc=f"API取得中... {len(all_posts)}/{fetch_limit} posts (page {page})",
+            )
         params = {"tags": api_tag_str, "limit": PER_PAGE, "page": page}
         resp = session.get(f"{BASE_URL}/posts.json", params=params)
 
@@ -172,7 +178,7 @@ def search_danbooru(
 # ============================================================
 # プレビュー画像取得
 # ============================================================
-def get_preview_data(posts: list) -> list:
+def get_preview_data(posts: list, progress_cb=None) -> list:
     """各投稿のプレビュー画像をダウンロードしてギャラリー用リストを返す"""
     import tempfile
     preview_dir = Path(tempfile.gettempdir()) / "danbooru_previews"
@@ -181,8 +187,14 @@ def get_preview_data(posts: list) -> list:
     session = requests.Session()
     session.headers["User-Agent"] = "DanbooruSearchUI/1.0"
 
+    total = len(posts)
     gallery_items = []
-    for p in posts:
+    for idx, p in enumerate(posts):
+        if progress_cb and total > 0:
+            progress_cb(
+                idx / total,
+                desc=f"プレビュー取得中... {idx}/{total}",
+            )
         pid = p["id"]
         # プレビューURL (小さい画像)
         preview_url = (
@@ -406,14 +418,18 @@ def download_selected(
 _current_posts = []
 
 
-def do_search(tags: str, max_results: int, rating: str, min_score: int):
+def do_search(
+    tags: str, max_results: int, rating: str, min_score: int, progress=gr.Progress()
+):
     """検索を実行してギャラリーとステータスを返す"""
     global _current_posts
 
-    posts, status = search_danbooru(tags, max_results, rating, min_score)
+    posts, status = search_danbooru(
+        tags, max_results, rating, min_score, progress_cb=progress
+    )
     _current_posts = posts
 
-    gallery_items = get_preview_data(posts)
+    gallery_items = get_preview_data(posts, progress_cb=progress)
     posts_json = json.dumps(posts)
 
     return gallery_items, status, posts_json
