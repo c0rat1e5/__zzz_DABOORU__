@@ -52,7 +52,9 @@ SDXL_RESOLUTIONS = [
 
 ALLOWED_EXT = {"jpg", "jpeg", "png", "webp", "gif"}
 
-PREVIEW_PER_PAGE = 50  # ギャラリー1ページあたりの表示数
+PREVIEW_PER_PAGE = 20  # ギャラリー1ページあたりの表示数 (5列×4行)
+GRID_COLS = 5
+GRID_ROWS = 4
 
 
 # ============================================================
@@ -426,10 +428,46 @@ def download_selected(
 _current_posts = []
 
 
+def _make_checkbox_choices(posts, page: int) -> list:
+    """(unused, kept for compat)"""
+    return []
+
+
+def _build_page_data(posts, page, selected_indices=None):
+    """現在ページの画像パスとチェック状態のリストを返す"""
+    import tempfile
+    preview_dir = Path(tempfile.gettempdir()) / "danbooru_previews"
+
+    if selected_indices is None:
+        selected_indices = set()
+
+    start = page * PREVIEW_PER_PAGE
+    end = min(start + PREVIEW_PER_PAGE, len(posts))
+    page_posts = posts[start:end]
+
+    results = []  # list of (image_path_or_None, label, is_checked)
+    for i, p in enumerate(page_posts):
+        pid = p["id"]
+        rating = p.get("rating", "?")
+        score = p.get("score", 0)
+        ext = (p.get("preview_file_url") or "").rsplit(".", 1)[-1].split("?")[0] or "jpg"
+        local_path = preview_dir / f"{pid}.{ext}"
+        img_path = str(local_path) if local_path.exists() else None
+        label = f"#{pid} r:{rating} s:{score}"
+        checked = (start + i) in selected_indices
+        results.append((img_path, label, checked))
+
+    # 不足分は None で埋める
+    while len(results) < PREVIEW_PER_PAGE:
+        results.append((None, "", False))
+
+    return results
+
+
 def do_search(
     tags: str, max_results: int, rating: str, min_score: int, progress=gr.Progress()
 ):
-    """検索を実行してギャラリーとステータスを返す"""
+    """検索を実行してカードグリッドとステータスを返す"""
     global _current_posts
 
     posts, status = search_danbooru(
@@ -438,39 +476,58 @@ def do_search(
     _current_posts = posts
     posts_json = json.dumps(posts)
 
-    # 最初のページのプレビューだけ取得
+    # 最初のページのプレビュー取得
     page_posts = posts[:PREVIEW_PER_PAGE]
-    gallery_items = get_preview_data(page_posts, progress_cb=progress)
+    get_preview_data(page_posts, progress_cb=progress)
 
     total_pages = max(1, (len(posts) + PREVIEW_PER_PAGE - 1) // PREVIEW_PER_PAGE)
-    page_info = f"ページ 1 / {total_pages}（全 {len(posts)} 件）"
-
-    # 検索時は選択をリセット
-    sel_json = json.dumps([])
+    pg_info = f"ページ 1 / {total_pages}（全 {len(posts)} 件）"
     sel_info = f"選択: 0 / {len(posts)} 件"
 
-    return gallery_items, status, posts_json, sel_json, sel_info, 0, page_info
+    page_data = _build_page_data(posts, 0)
+
+    # 各スロットの更新値を生成
+    outputs = []
+    for img_path, label, checked in page_data:
+        outputs.append(gr.update(value=img_path, visible=img_path is not None))
+        outputs.append(gr.update(value=checked, label=label, visible=img_path is not None))
+
+    return [status, posts_json, "[]", sel_info, 0, pg_info] + outputs
 
 
-def do_page_change(posts_json: str, current_page: int, direction: int, progress=gr.Progress()):
+def do_page_change(
+    posts_json: str, selected_json: str, current_page: int, direction: int,
+    progress=gr.Progress(),
+):
     """ページ切り替え"""
     if not posts_json:
-        return [], 0, "データなし"
+        outputs = []
+        for _ in range(PREVIEW_PER_PAGE):
+            outputs.append(gr.update(value=None, visible=False))
+            outputs.append(gr.update(value=False, visible=False))
+        return [0, "データなし"] + outputs
 
     posts = json.loads(posts_json)
+    selected_indices = set(json.loads(selected_json)) if selected_json else set()
     total_pages = max(1, (len(posts) + PREVIEW_PER_PAGE - 1) // PREVIEW_PER_PAGE)
 
     new_page = current_page + direction
     new_page = max(0, min(new_page, total_pages - 1))
 
+    # プレビュー取得 (未キャッシュのみ)
     start = new_page * PREVIEW_PER_PAGE
-    end = start + PREVIEW_PER_PAGE
-    page_posts = posts[start:end]
+    end = min(start + PREVIEW_PER_PAGE, len(posts))
+    get_preview_data(posts[start:end], progress_cb=progress)
 
-    gallery_items = get_preview_data(page_posts, progress_cb=progress)
-    page_info = f"ページ {new_page + 1} / {total_pages}（全 {len(posts)} 件）"
+    pg_info = f"ページ {new_page + 1} / {total_pages}（全 {len(posts)} 件）"
+    page_data = _build_page_data(posts, new_page, selected_indices)
 
-    return gallery_items, new_page, page_info
+    outputs = []
+    for img_path, label, checked in page_data:
+        outputs.append(gr.update(value=img_path, visible=img_path is not None))
+        outputs.append(gr.update(value=checked, label=label, visible=img_path is not None))
+
+    return [new_page, pg_info] + outputs
 
 
 def do_download(
@@ -545,13 +602,31 @@ def create_ui():
 
         status_text = gr.Textbox(label="検索ステータス", interactive=False, lines=4)
 
-        gallery = gr.Gallery(
-            label="検索結果（クリックで選択/解除）",
-            columns=5,
-            rows=4,
-            height="auto",
-            object_fit="contain",
-        )
+        # --- 画像カードグリッド (5列×4行 = 20スロット) ---
+        # 各スロット: Image + Checkbox
+        image_slots = []   # gr.Image のリスト
+        check_slots = []   # gr.Checkbox のリスト
+
+        for row in range(GRID_ROWS):
+            with gr.Row():
+                for col in range(GRID_COLS):
+                    with gr.Column(min_width=120):
+                        img = gr.Image(
+                            value=None,
+                            label=None,
+                            show_label=False,
+                            height=150,
+                            width=150,
+                            interactive=False,
+                            visible=False,
+                        )
+                        cb = gr.Checkbox(
+                            value=False,
+                            label="",
+                            visible=False,
+                        )
+                        image_slots.append(img)
+                        check_slots.append(cb)
 
         # --- ページナビゲーション ---
         with gr.Row():
@@ -559,12 +634,13 @@ def create_ui():
             page_info = gr.Markdown(value="ページ 0 / 0")
             next_page_btn = gr.Button("次ページ ▶", size="sm")
 
-        # --- 選択操作 UI ---
+        # --- 選択操作 ---
         with gr.Row():
-            select_all_btn = gr.Button("✅ 全選択", size="sm")
-            select_page_btn = gr.Button("☑️ このページを選択", size="sm")
-            deselect_all_btn = gr.Button("❌ 全解除", size="sm")
-            selected_info = gr.Markdown(value="選択: 0 / 0 件")
+            select_page_btn = gr.Button("✅ このページ全選択", size="sm")
+            deselect_page_btn = gr.Button("❌ このページ全解除", size="sm")
+            select_all_pages_btn = gr.Button("📦 全ページ選択", size="sm")
+            deselect_all_btn = gr.Button("🗑️ 全ページ解除", size="sm")
+        selected_info = gr.Markdown(value="選択: 0 / 0 件")
 
         gr.Markdown("---")
         gr.Markdown("### ダウンロード設定")
@@ -614,98 +690,126 @@ def create_ui():
             outputs=[search_btn, tag_warning],
         )
 
-        # --- ギャラリー選択ハンドラ ---
-        def on_gallery_select(selected_json, posts_json, current_page, evt: gr.SelectData):
-            """ギャラリーの画像をクリックしたとき、選択をトグル (グローバルインデックスで管理)"""
+        # --- チェックボックス変更時: 選択状態を反映 ---
+        def on_checkbox_change(slot_idx, checked, selected_json, posts_json, current_page):
             selected = set(json.loads(selected_json)) if selected_json else set()
-            # ギャラリー上のインデックス → グローバルインデックス
-            global_idx = current_page * PREVIEW_PER_PAGE + evt.index
-            if global_idx in selected:
-                selected.discard(global_idx)
-            else:
-                selected.add(global_idx)
-
-            total = len(json.loads(posts_json)) if posts_json else 0
-            sel_json = json.dumps(sorted(selected))
+            posts = json.loads(posts_json) if posts_json else []
+            global_idx = current_page * PREVIEW_PER_PAGE + slot_idx
+            if global_idx < len(posts):
+                if checked:
+                    selected.add(global_idx)
+                else:
+                    selected.discard(global_idx)
+            total = len(posts)
             info = f"**選択: {len(selected)} / {total} 件**"
             if len(selected) > 0:
                 info += " — ダウンロード可能"
-            return sel_json, info
+            return json.dumps(sorted(selected)), info
 
-        def select_all(posts_json):
-            """全選択"""
-            posts = json.loads(posts_json) if posts_json else []
-            all_indices = list(range(len(posts)))
-            return (
-                json.dumps(all_indices),
-                f"**選択: {len(posts)} / {len(posts)} 件** — ダウンロード可能",
+        for slot_i, cb in enumerate(check_slots):
+            cb.change(
+                fn=lambda checked, sj, pj, cp, _i=slot_i: on_checkbox_change(_i, checked, sj, pj, cp),
+                inputs=[cb, selected_state, posts_state, page_state],
+                outputs=[selected_state, selected_info],
             )
 
-        def select_current_page(selected_json, posts_json, current_page):
-            """現在のページの画像をすべて選択に追加"""
+        # --- ページ内全選択 / 全解除 ---
+        def select_page(posts_json, selected_json, current_page):
             selected = set(json.loads(selected_json)) if selected_json else set()
             posts = json.loads(posts_json) if posts_json else []
             start = current_page * PREVIEW_PER_PAGE
             end = min(start + PREVIEW_PER_PAGE, len(posts))
             for i in range(start, end):
                 selected.add(i)
-            sel_json = json.dumps(sorted(selected))
+            # チェックボックスを全部オン
+            cb_updates = []
+            for j in range(PREVIEW_PER_PAGE):
+                if start + j < len(posts):
+                    cb_updates.append(gr.update(value=True))
+                else:
+                    cb_updates.append(gr.update())
+            info = f"**選択: {len(selected)} / {len(posts)} 件** — ダウンロード可能"
+            return [json.dumps(sorted(selected)), info] + cb_updates
+
+        def deselect_page(posts_json, selected_json, current_page):
+            selected = set(json.loads(selected_json)) if selected_json else set()
+            posts = json.loads(posts_json) if posts_json else []
+            start = current_page * PREVIEW_PER_PAGE
+            end = min(start + PREVIEW_PER_PAGE, len(posts))
+            for i in range(start, end):
+                selected.discard(i)
+            cb_updates = [gr.update(value=False) for _ in range(PREVIEW_PER_PAGE)]
             info = f"**選択: {len(selected)} / {len(posts)} 件**"
             if len(selected) > 0:
                 info += " — ダウンロード可能"
-            return sel_json, info
+            return [json.dumps(sorted(selected)), info] + cb_updates
 
-        def deselect_all(posts_json):
-            """全解除"""
+        def select_all_pages(posts_json):
+            posts = json.loads(posts_json) if posts_json else []
+            all_indices = list(range(len(posts)))
+            return json.dumps(all_indices), f"**選択: {len(posts)} / {len(posts)} 件** — ダウンロード可能"
+
+        def deselect_all_pages(posts_json):
             total = len(json.loads(posts_json)) if posts_json else 0
             return json.dumps([]), f"選択: 0 / {total} 件"
 
-        gallery.select(
-            fn=on_gallery_select,
-            inputs=[selected_state, posts_state, page_state],
-            outputs=[selected_state, selected_info],
+        select_page_btn.click(
+            fn=select_page,
+            inputs=[posts_state, selected_state, page_state],
+            outputs=[selected_state, selected_info] + check_slots,
         )
 
-        select_all_btn.click(
-            fn=select_all,
+        deselect_page_btn.click(
+            fn=deselect_page,
+            inputs=[posts_state, selected_state, page_state],
+            outputs=[selected_state, selected_info] + check_slots,
+        )
+
+        select_all_pages_btn.click(
+            fn=select_all_pages,
             inputs=[posts_state],
             outputs=[selected_state, selected_info],
         )
 
-        select_page_btn.click(
-            fn=select_current_page,
-            inputs=[selected_state, posts_state, page_state],
-            outputs=[selected_state, selected_info],
-        )
-
         deselect_all_btn.click(
-            fn=deselect_all,
+            fn=deselect_all_pages,
             inputs=[posts_state],
             outputs=[selected_state, selected_info],
         )
 
         # --- ページナビゲーション ---
+        # interleave image_slots and check_slots for outputs
+        page_grid_outputs = []
+        for img, cb in zip(image_slots, check_slots):
+            page_grid_outputs.append(img)
+            page_grid_outputs.append(cb)
+
         prev_page_btn.click(
-            fn=lambda pj, cp: do_page_change(pj, cp, -1),
-            inputs=[posts_state, page_state],
-            outputs=[gallery, page_state, page_info],
+            fn=lambda pj, sj, cp: do_page_change(pj, sj, cp, -1),
+            inputs=[posts_state, selected_state, page_state],
+            outputs=[page_state, page_info] + page_grid_outputs,
         )
 
         next_page_btn.click(
-            fn=lambda pj, cp: do_page_change(pj, cp, +1),
-            inputs=[posts_state, page_state],
-            outputs=[gallery, page_state, page_info],
+            fn=lambda pj, sj, cp: do_page_change(pj, sj, cp, +1),
+            inputs=[posts_state, selected_state, page_state],
+            outputs=[page_state, page_info] + page_grid_outputs,
         )
 
-        # イベント接続
+        # --- 検索イベント ---
+        search_grid_outputs = []
+        for img, cb in zip(image_slots, check_slots):
+            search_grid_outputs.append(img)
+            search_grid_outputs.append(cb)
+
         search_btn.click(
             fn=do_search,
             inputs=[tags_input, max_results, rating_filter, min_score],
             outputs=[
-                gallery, status_text, posts_state,
+                status_text, posts_state,
                 selected_state, selected_info,
                 page_state, page_info,
-            ],
+            ] + search_grid_outputs,
         )
 
         # Enter キーでも検索
@@ -713,10 +817,10 @@ def create_ui():
             fn=do_search,
             inputs=[tags_input, max_results, rating_filter, min_score],
             outputs=[
-                gallery, status_text, posts_state,
+                status_text, posts_state,
                 selected_state, selected_info,
                 page_state, page_info,
-            ],
+            ] + search_grid_outputs,
         )
 
         download_btn.click(
