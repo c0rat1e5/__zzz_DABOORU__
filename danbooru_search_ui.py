@@ -186,6 +186,7 @@ def search_danbooru(
 def get_preview_data(posts: list, progress_cb=None) -> list:
     """各投稿のプレビュー画像をダウンロードしてギャラリー用リストを返す"""
     import tempfile
+
     preview_dir = Path(tempfile.gettempdir()) / "danbooru_previews"
     preview_dir.mkdir(exist_ok=True)
 
@@ -437,12 +438,38 @@ def do_search(
     gallery_items = get_preview_data(posts, progress_cb=progress)
     posts_json = json.dumps(posts)
 
-    return gallery_items, status, posts_json
+    # 検索時は選択をリセット
+    selected_set = set()
+    sel_json = json.dumps(list(selected_set))
+    sel_info = f"選択: 0 / {len(posts)} 件"
+
+    return gallery_items, status, posts_json, sel_json, sel_info
 
 
-def do_download(posts_json: str, do_resize: bool, do_xmp: bool, output_folder: str):
-    """ダウンロードを実行"""
-    return download_selected(posts_json, do_resize, do_xmp, output_folder)
+def do_download(
+    posts_json: str,
+    selected_json: str,
+    do_resize: bool,
+    do_xmp: bool,
+    output_folder: str,
+):
+    """選択された投稿のみダウンロード"""
+    if not posts_json:
+        return "データがありません。まず検索してください。"
+
+    all_posts = json.loads(posts_json)
+    selected_indices = set(json.loads(selected_json)) if selected_json else set()
+
+    if not selected_indices:
+        return "⚠️ ダウンロードする画像を選択してください。\nギャラリーの画像をクリックして選択/解除できます。"
+
+    # 選択されたインデックスの投稿だけ抽出
+    selected_posts = [
+        all_posts[i] for i in sorted(selected_indices) if i < len(all_posts)
+    ]
+    selected_posts_json = json.dumps(selected_posts)
+
+    return download_selected(selected_posts_json, do_resize, do_xmp, output_folder)
 
 
 # ============================================================
@@ -459,6 +486,7 @@ def create_ui():
         )
 
         posts_state = gr.State("")
+        selected_state = gr.State("[]")
 
         with gr.Row():
             with gr.Column(scale=3):
@@ -483,17 +511,25 @@ def create_ui():
                 value="all",
                 label="Rating フィルタ",
             )
-            search_btn = gr.Button("🔍 検索", variant="primary", size="lg", interactive=False)
+            search_btn = gr.Button(
+                "🔍 検索", variant="primary", size="lg", interactive=False
+            )
 
         status_text = gr.Textbox(label="検索ステータス", interactive=False, lines=4)
 
         gallery = gr.Gallery(
-            label="検索結果",
+            label="検索結果（クリックで選択/解除）",
             columns=5,
             rows=4,
             height="auto",
             object_fit="contain",
         )
+
+        # --- 選択操作 UI ---
+        with gr.Row():
+            select_all_btn = gr.Button("✅ 全選択", size="sm")
+            deselect_all_btn = gr.Button("❌ 全解除", size="sm")
+            selected_info = gr.Markdown(value="選択: 0 / 0 件")
 
         gr.Markdown("---")
         gr.Markdown("### ダウンロード設定")
@@ -510,7 +546,9 @@ def create_ui():
         )
 
         with gr.Row():
-            download_btn = gr.Button("⬇️ 全件ダウンロード", variant="primary", size="lg")
+            download_btn = gr.Button(
+                "⬇️ 選択画像をダウンロード", variant="primary", size="lg"
+            )
 
         download_log = gr.Textbox(label="ダウンロードログ", interactive=False, lines=8)
 
@@ -541,23 +579,72 @@ def create_ui():
             outputs=[search_btn, tag_warning],
         )
 
+        # --- ギャラリー選択ハンドラ ---
+        def on_gallery_select(selected_json, posts_json, evt: gr.SelectData):
+            """ギャラリーの画像をクリックしたとき、選択をトグル"""
+            selected = set(json.loads(selected_json)) if selected_json else set()
+            idx = evt.index
+            if idx in selected:
+                selected.discard(idx)
+            else:
+                selected.add(idx)
+
+            total = len(json.loads(posts_json)) if posts_json else 0
+            sel_json = json.dumps(sorted(selected))
+            info = f"**選択: {len(selected)} / {total} 件**"
+            if len(selected) > 0:
+                info += " — ダウンロード可能"
+            return sel_json, info
+
+        def select_all(posts_json):
+            """全選択"""
+            posts = json.loads(posts_json) if posts_json else []
+            all_indices = list(range(len(posts)))
+            return (
+                json.dumps(all_indices),
+                f"**選択: {len(posts)} / {len(posts)} 件** — ダウンロード可能",
+            )
+
+        def deselect_all(posts_json):
+            """全解除"""
+            total = len(json.loads(posts_json)) if posts_json else 0
+            return json.dumps([]), f"選択: 0 / {total} 件"
+
+        gallery.select(
+            fn=on_gallery_select,
+            inputs=[selected_state, posts_state],
+            outputs=[selected_state, selected_info],
+        )
+
+        select_all_btn.click(
+            fn=select_all,
+            inputs=[posts_state],
+            outputs=[selected_state, selected_info],
+        )
+
+        deselect_all_btn.click(
+            fn=deselect_all,
+            inputs=[posts_state],
+            outputs=[selected_state, selected_info],
+        )
+
         # イベント接続
         search_btn.click(
             fn=do_search,
             inputs=[tags_input, max_results, rating_filter, min_score],
-            outputs=[gallery, status_text, posts_state],
+            outputs=[gallery, status_text, posts_state, selected_state, selected_info],
         )
 
         # Enter キーでも検索
         tags_input.submit(
             fn=do_search,
             inputs=[tags_input, max_results, rating_filter, min_score],
-            outputs=[gallery, status_text, posts_state],
+            outputs=[gallery, status_text, posts_state, selected_state, selected_info],
         )
 
         download_btn.click(
             fn=do_download,
-            inputs=[posts_state, do_resize, do_xmp, output_folder],
+            inputs=[posts_state, selected_state, do_resize, do_xmp, output_folder],
             outputs=[download_log],
         )
 
