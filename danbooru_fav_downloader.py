@@ -33,7 +33,7 @@ TAGS_QUERY = "ordfav:palm_floods"
 PER_PAGE = 200  # Danbooru API max
 
 SCRIPT_DIR = Path(__file__).parent.resolve()
-OUTPUT_DIR = SCRIPT_DIR / "danbooru_favorites"
+OUTPUT_DIR = SCRIPT_DIR / "danbooru_output"
 JSON_FILE = OUTPUT_DIR / "_posts_metadata.json"
 
 BASE_URL = "https://danbooru.donmai.us"
@@ -279,18 +279,170 @@ def download_images(records: list, output_dir: Path) -> int:
 
 
 # ============================================================
-# XMP 埋め込み (exiftool)
+# XMP 埋め込み (exiftool or Pillow fallback)
 # ============================================================
 def check_exiftool() -> bool:
-    return shutil.which("exiftool") is not None
+    return _get_exiftool_path() is not None
+
+
+def _get_exiftool_path() -> str:
+    """exiftool のパスを返す (PATH or ローカル)"""
+    # PATH にあるか
+    p = shutil.which("exiftool")
+    if p:
+        return p
+    # スクリプトと同じフォルダにあるか
+    local = SCRIPT_DIR / "exiftool.exe"
+    if local.exists():
+        return str(local)
+    local2 = SCRIPT_DIR / "exiftool"
+    if local2.exists():
+        return str(local2)
+    return None
+
+
+def _build_xmp_packet(tags_list: list, rating: str, score: int, full_desc: str) -> str:
+    """XMP XML パケットを構築"""
+    # XML エスケープ
+    def esc(s):
+        return s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace('"', "&quot;")
+
+    subject_items = ""
+    for tag in tags_list:
+        subject_items += f"        <rdf:li>{esc(tag)}</rdf:li>\n"
+    subject_items += f"        <rdf:li>rating:{esc(rating)}</rdf:li>\n"
+    subject_items += f"        <rdf:li>score:{score}</rdf:li>\n"
+
+    xmp = f'''<?xpacket begin="\xef\xbb\xbf" id="W5M0MpCehiHzreSzNTczkc9d"?>
+<x:xmpmeta xmlns:x="adobe:ns:meta/">
+  <rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">
+    <rdf:Description
+      xmlns:dc="http://purl.org/dc/elements/1.1/"
+      xmlns:xmp="http://ns.adobe.com/xap/1.0/">
+      <dc:description>
+        <rdf:Alt>
+          <rdf:li xml:lang="x-default">{esc(full_desc)}</rdf:li>
+        </rdf:Alt>
+      </dc:description>
+      <dc:title>
+        <rdf:Alt>
+          <rdf:li xml:lang="x-default">{esc(full_desc)}</rdf:li>
+        </rdf:Alt>
+      </dc:title>
+      <dc:subject>
+        <rdf:Bag>
+{subject_items}        </rdf:Bag>
+      </dc:subject>
+    </rdf:Description>
+  </rdf:RDF>
+</x:xmpmeta>
+<?xpacket end="w"?>'''
+    return xmp
+
+
+def _embed_xmp_to_jpeg(filepath: Path, xmp_packet: str) -> bool:
+    """JPEG に XMP パケットを埋め込む (APP1 マーカー)"""
+    xmp_bytes = xmp_packet.encode("utf-8")
+    xmp_header = b"http://ns.adobe.com/xap/1.0/\x00"
+    app1_data = xmp_header + xmp_bytes
+    app1_length = len(app1_data) + 2  # +2 for length bytes
+
+    with open(filepath, "rb") as f:
+        data = f.read()
+
+    if data[:2] != b"\xff\xd8":
+        return False  # Not JPEG
+
+    # 既存の XMP APP1 セグメントを除去
+    pos = 2
+    new_data = b"\xff\xd8"
+    while pos < len(data):
+        if data[pos:pos+2] == b"\xff\xe1":
+            seg_len = int.from_bytes(data[pos+2:pos+4], "big")
+            seg_body = data[pos+4:pos+2+seg_len]
+            if seg_body.startswith(b"http://ns.adobe.com/xap/1.0/\x00"):
+                pos += 2 + seg_len
+                continue
+        break
+
+    # 残りのデータ
+    rest = data[pos:]
+
+    # 新しい APP1 を挿入
+    app1_marker = b"\xff\xe1" + app1_length.to_bytes(2, "big") + app1_data
+    result = b"\xff\xd8" + app1_marker + rest
+
+    with open(filepath, "wb") as f:
+        f.write(result)
+    return True
+
+
+def _embed_xmp_to_png(filepath: Path, xmp_packet: str) -> bool:
+    """PNG に XMP を iTXt チャンクとして埋め込む"""
+    from PIL import Image as PILImage
+    from PIL.PngImagePlugin import PngInfo
+
+    img = PILImage.open(filepath)
+    meta = PngInfo()
+    meta.add_text("XML:com.adobe.xmp", xmp_packet, zip=False)
+    # description もテキストチャンクに
+    img.save(filepath, "PNG", pnginfo=meta)
+    return True
+
+
+def embed_xmp_single(filepath: Path, tags_str: str, rating: str, score: int) -> bool:
+    """1ファイルに XMP を埋め込む"""
+    # タグをリストに分割 (カンマ区切り対応)
+    tags_list = [t.strip() for t in tags_str.split(",") if t.strip()]
+    full_desc = f"{tags_str} rating:{rating} score:{score}"
+
+    ext = filepath.suffix.lower()
+
+    # exiftool があればそれを使う (最も確実)
+    exiftool_path = _get_exiftool_path()
+    if exiftool_path:
+        cmd = [
+            exiftool_path, "-overwrite_original",
+            f"-XMP:Description={full_desc}",
+            f"-XMP:Title={full_desc}",
+            "-charset", "iptc=UTF8",
+        ]
+        for tag in tags_list:
+            cmd.append(f"-XMP:Subject+={tag}")
+        cmd += [f"-XMP:Subject+=rating:{rating}", f"-XMP:Subject+=score:{score}"]
+        cmd.append(str(filepath))
+        try:
+            result = subprocess.run(cmd, capture_output=True, text=True)
+            return "1 image files updated" in result.stdout
+        except:
+            pass
+
+    # exiftool なし → Python で直接埋め込む
+    xmp_packet = _build_xmp_packet(tags_list, rating, score, full_desc)
+
+    try:
+        if ext in (".jpg", ".jpeg"):
+            return _embed_xmp_to_jpeg(filepath, xmp_packet)
+        elif ext == ".png":
+            return _embed_xmp_to_png(filepath, xmp_packet)
+        elif ext == ".webp":
+            # WebP は XMP 埋め込みが複雑なので、サイドカーファイルで対応
+            xmp_path = filepath.with_suffix(".xmp")
+            xmp_path.write_text(xmp_packet, encoding="utf-8")
+            return True
+    except Exception as e:
+        print(f"  XMP embed error {filepath.name}: {e}")
+
+    return False
 
 
 def embed_xmp(records: list, output_dir: Path) -> int:
-    """data-tags + rating + score を XMP:Description / Title / Subject に書き込み"""
-    if not check_exiftool():
-        print("  WARNING: exiftool not found. Skipping XMP.")
-        print("  -> https://exiftool.org/ download & add to PATH")
-        return 0
+    """全ファイルに XMP を埋め込む"""
+    has_exiftool = check_exiftool()
+    if has_exiftool:
+        print("  Using: exiftool")
+    else:
+        print("  Using: Python built-in XMP writer (exiftool not found)")
 
     embedded = 0
     total = sum(1 for r in records if (output_dir / f"{r['data-id']}.{r['file_ext']}").exists())
@@ -303,27 +455,11 @@ def embed_xmp(records: list, output_dir: Path) -> int:
         tags_str = rec["data-tags"]
         rating = rec["data-rating"]
         score = rec["data-score"]
-        full_desc = f"{tags_str} rating:{rating} score:{score}"
 
-        cmd = [
-            "exiftool", "-overwrite_original",
-            f"-XMP:Description={full_desc}",
-            f"-XMP:Title={full_desc}",
-            "-charset", "iptc=UTF8",
-        ]
-        for tag in tags_str.split():
-            cmd.append(f"-XMP:Subject+={tag}")
-        cmd += [f"-XMP:Subject+=rating:{rating}", f"-XMP:Subject+=score:{score}"]
-        cmd.append(str(fp))
-
-        try:
-            result = subprocess.run(cmd, capture_output=True, text=True)
-            if "1 image files updated" in result.stdout:
-                embedded += 1
-                if embedded <= 3 or embedded % 20 == 0:
-                    print(f"  XMP [{embedded}/{total}] #{rec['data-id']}")
-        except Exception as e:
-            print(f"  XMP error #{rec['data-id']}: {e}")
+        if embed_xmp_single(fp, tags_str, rating, score):
+            embedded += 1
+            if embedded <= 3 or embedded % 20 == 0:
+                print(f"  XMP [{embedded}/{total}] #{rec['data-id']}")
 
     return embedded
 
