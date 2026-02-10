@@ -73,6 +73,11 @@ def search_danbooru(
     if not tags:
         return [], "タグを入力してください"
 
+    # 除外タグを除いた検索タグが3つ未満なら拒否
+    include_only = [t for t in tags if not t.startswith("-")]
+    if len(include_only) < 3:
+        return [], f"⚠️ 検索タグを3つ以上入力してください（現在 {len(include_only)} 個）"
+
     # +タグ と -タグ を分離
     include_tags = [t for t in tags if not t.startswith("-")]
     exclude_tags = [t.lstrip("-") for t in tags if t.startswith("-")]
@@ -458,9 +463,13 @@ def create_ui():
         with gr.Row():
             with gr.Column(scale=3):
                 tags_input = gr.Textbox(
-                    label="タグ (スペース区切り・何個でもOK)",
+                    label="タグ (スペース区切り・3個以上必須)",
                     placeholder="1girl blue_hair large_breasts highres solo -comic -monochrome",
                     lines=2,
+                )
+                tag_warning = gr.Markdown(
+                    value="⚠️ **検索タグを3つ以上入力してください**（除外タグ `-tag` はカウントしません）",
+                    visible=True,
                 )
             with gr.Column(scale=1):
                 max_results = gr.Slider(
@@ -474,7 +483,7 @@ def create_ui():
                 value="all",
                 label="Rating フィルタ",
             )
-            search_btn = gr.Button("🔍 検索", variant="primary", size="lg")
+            search_btn = gr.Button("🔍 検索", variant="primary", size="lg", interactive=False)
 
         status_text = gr.Textbox(label="検索ステータス", interactive=False, lines=4)
 
@@ -504,6 +513,33 @@ def create_ui():
             download_btn = gr.Button("⬇️ 全件ダウンロード", variant="primary", size="lg")
 
         download_log = gr.Textbox(label="ダウンロードログ", interactive=False, lines=8)
+
+        # --- タグ数バリデーション ---
+        def validate_tags(text):
+            include = [t for t in text.strip().split() if not t.startswith("-")]
+            count = len(include)
+            if count >= 3:
+                return (
+                    gr.update(interactive=True),
+                    gr.update(
+                        value=f"✅ **検索タグ: {count} 個** — 検索できます",
+                        visible=True,
+                    ),
+                )
+            else:
+                return (
+                    gr.update(interactive=False),
+                    gr.update(
+                        value=f"⚠️ **検索タグを3つ以上入力してください**（現在 {count} 個、除外タグ `-tag` はカウントしません）",
+                        visible=True,
+                    ),
+                )
+
+        tags_input.change(
+            fn=validate_tags,
+            inputs=[tags_input],
+            outputs=[search_btn, tag_warning],
+        )
 
         # イベント接続
         search_btn.click(
