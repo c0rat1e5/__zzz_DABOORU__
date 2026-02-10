@@ -15,8 +15,6 @@ import os
 import re
 import sys
 import time
-import shutil
-import subprocess
 from pathlib import Path
 from urllib.parse import urlencode
 
@@ -289,22 +287,8 @@ def resize_to_sdxl(filepath: Path) -> bool:
 
 
 # ============================================================
-# XMP 埋め込み (exiftool → Python fallback)
+# XMP 埋め込み (Python 内蔵)
 # ============================================================
-def _get_exiftool_path() -> str:
-    """exiftool のパスを返す (PATH or ローカル)"""
-    p = shutil.which("exiftool")
-    if p:
-        return p
-    local = SCRIPT_DIR / "exiftool.exe"
-    if local.exists():
-        return str(local)
-    local2 = SCRIPT_DIR / "exiftool"
-    if local2.exists():
-        return str(local2)
-    return None
-
-
 def _build_xmp_packet(tags_list: list, rating: str, score: int, full_desc: str) -> str:
     """XMP XML パケットを構築"""
 
@@ -393,46 +377,61 @@ def _embed_xmp_to_png(filepath: Path, xmp_packet: str) -> bool:
     return True
 
 
+def _embed_xmp_to_webp(filepath: Path, xmp_packet: str) -> bool:
+    """WebP に XMP を埋め込む (RIFF チャンク操作)"""
+    xmp_bytes = xmp_packet.encode("utf-8")
+
+    with open(filepath, "rb") as f:
+        data = f.read()
+
+    if data[:4] != b"RIFF" or data[8:12] != b"WEBP":
+        xmp_path = filepath.with_suffix(".xmp")
+        xmp_path.write_text(xmp_packet, encoding="utf-8")
+        return True
+
+    pos = 12
+    chunks = []
+    while pos < len(data):
+        if pos + 8 > len(data):
+            break
+        chunk_id = data[pos:pos+4]
+        chunk_size = int.from_bytes(data[pos+4:pos+8], "little")
+        chunk_data = data[pos+8:pos+8+chunk_size]
+        padded_size = chunk_size + (chunk_size % 2)
+        if chunk_id != b"XMP ":
+            chunks.append((chunk_id, chunk_data))
+        pos += 8 + padded_size
+
+    chunks.append((b"XMP ", xmp_bytes))
+
+    body = b"WEBP"
+    for chunk_id, chunk_data in chunks:
+        size = len(chunk_data)
+        body += chunk_id + size.to_bytes(4, "little") + chunk_data
+        if size % 2 == 1:
+            body += b"\x00"
+
+    result = b"RIFF" + len(body).to_bytes(4, "little") + body
+
+    with open(filepath, "wb") as f:
+        f.write(result)
+    return True
+
+
 def embed_xmp(filepath: Path, tags_str: str, rating: str, score: int) -> bool:
-    """1ファイルに XMP を埋め込む (exiftool優先 → Python fallback)"""
+    """1ファイルに XMP を埋め込む (Python 内蔵)"""
     tags_list = [t.strip() for t in tags_str.split(",") if t.strip()]
     full_desc = f"{tags_str} rating:{rating} score:{score}"
-    ext = filepath.suffix.lower()
-
-    # exiftool があればそれを使う (最も確実)
-    exiftool_path = _get_exiftool_path()
-    if exiftool_path:
-        cmd = [
-            exiftool_path,
-            "-overwrite_original",
-            f"-XMP:Description={full_desc}",
-            f"-XMP:Title={full_desc}",
-            "-charset",
-            "iptc=UTF8",
-        ]
-        for tag in tags_list:
-            cmd.append(f"-XMP:Subject+={tag}")
-        cmd += [f"-XMP:Subject+=rating:{rating}", f"-XMP:Subject+=score:{score}"]
-        cmd.append(str(filepath))
-        try:
-            result = subprocess.run(cmd, capture_output=True, text=True)
-            if "1 image files updated" in result.stdout:
-                return True
-        except:
-            pass
-
-    # exiftool なし or 失敗 → Python で直接埋め込む
     xmp_packet = _build_xmp_packet(tags_list, rating, score, full_desc)
 
+    ext = filepath.suffix.lower()
     try:
         if ext in (".jpg", ".jpeg"):
             return _embed_xmp_to_jpeg(filepath, xmp_packet)
         elif ext == ".png":
             return _embed_xmp_to_png(filepath, xmp_packet)
         elif ext == ".webp":
-            xmp_path = filepath.with_suffix(".xmp")
-            xmp_path.write_text(xmp_packet, encoding="utf-8")
-            return True
+            return _embed_xmp_to_webp(filepath, xmp_packet)
     except Exception as e:
         print(f"  XMP embed error {filepath.name}: {e}")
 
@@ -784,7 +783,7 @@ def create_ui():
             do_resize = gr.Checkbox(
                 value=True, label="SDXL リサイズ (平均色パディング)"
             )
-            do_xmp = gr.Checkbox(value=True, label="XMP タグ埋め込み (exiftool)")
+            do_xmp = gr.Checkbox(value=True, label="XMP タグ埋め込み")
 
         output_folder = gr.Textbox(
             label="保存先フォルダ",
