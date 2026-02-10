@@ -52,6 +52,8 @@ SDXL_RESOLUTIONS = [
 
 ALLOWED_EXT = {"jpg", "jpeg", "png", "webp", "gif"}
 
+PREVIEW_PER_PAGE = 50  # ギャラリー1ページあたりの表示数
+
 
 # ============================================================
 # Danbooru API 検索 (2タグ制限回避)
@@ -434,16 +436,41 @@ def do_search(
         tags, max_results, rating, min_score, progress_cb=progress
     )
     _current_posts = posts
-
-    gallery_items = get_preview_data(posts, progress_cb=progress)
     posts_json = json.dumps(posts)
 
+    # 最初のページのプレビューだけ取得
+    page_posts = posts[:PREVIEW_PER_PAGE]
+    gallery_items = get_preview_data(page_posts, progress_cb=progress)
+
+    total_pages = max(1, (len(posts) + PREVIEW_PER_PAGE - 1) // PREVIEW_PER_PAGE)
+    page_info = f"ページ 1 / {total_pages}（全 {len(posts)} 件）"
+
     # 検索時は選択をリセット
-    selected_set = set()
-    sel_json = json.dumps(list(selected_set))
+    sel_json = json.dumps([])
     sel_info = f"選択: 0 / {len(posts)} 件"
 
-    return gallery_items, status, posts_json, sel_json, sel_info
+    return gallery_items, status, posts_json, sel_json, sel_info, 0, page_info
+
+
+def do_page_change(posts_json: str, current_page: int, direction: int, progress=gr.Progress()):
+    """ページ切り替え"""
+    if not posts_json:
+        return [], 0, "データなし"
+
+    posts = json.loads(posts_json)
+    total_pages = max(1, (len(posts) + PREVIEW_PER_PAGE - 1) // PREVIEW_PER_PAGE)
+
+    new_page = current_page + direction
+    new_page = max(0, min(new_page, total_pages - 1))
+
+    start = new_page * PREVIEW_PER_PAGE
+    end = start + PREVIEW_PER_PAGE
+    page_posts = posts[start:end]
+
+    gallery_items = get_preview_data(page_posts, progress_cb=progress)
+    page_info = f"ページ {new_page + 1} / {total_pages}（全 {len(posts)} 件）"
+
+    return gallery_items, new_page, page_info
 
 
 def do_download(
@@ -487,6 +514,7 @@ def create_ui():
 
         posts_state = gr.State("")
         selected_state = gr.State("[]")
+        page_state = gr.State(0)  # 現在のページ (0-indexed)
 
         with gr.Row():
             with gr.Column(scale=3):
@@ -525,9 +553,16 @@ def create_ui():
             object_fit="contain",
         )
 
+        # --- ページナビゲーション ---
+        with gr.Row():
+            prev_page_btn = gr.Button("◀ 前ページ", size="sm")
+            page_info = gr.Markdown(value="ページ 0 / 0")
+            next_page_btn = gr.Button("次ページ ▶", size="sm")
+
         # --- 選択操作 UI ---
         with gr.Row():
             select_all_btn = gr.Button("✅ 全選択", size="sm")
+            select_page_btn = gr.Button("☑️ このページを選択", size="sm")
             deselect_all_btn = gr.Button("❌ 全解除", size="sm")
             selected_info = gr.Markdown(value="選択: 0 / 0 件")
 
@@ -580,14 +615,15 @@ def create_ui():
         )
 
         # --- ギャラリー選択ハンドラ ---
-        def on_gallery_select(selected_json, posts_json, evt: gr.SelectData):
-            """ギャラリーの画像をクリックしたとき、選択をトグル"""
+        def on_gallery_select(selected_json, posts_json, current_page, evt: gr.SelectData):
+            """ギャラリーの画像をクリックしたとき、選択をトグル (グローバルインデックスで管理)"""
             selected = set(json.loads(selected_json)) if selected_json else set()
-            idx = evt.index
-            if idx in selected:
-                selected.discard(idx)
+            # ギャラリー上のインデックス → グローバルインデックス
+            global_idx = current_page * PREVIEW_PER_PAGE + evt.index
+            if global_idx in selected:
+                selected.discard(global_idx)
             else:
-                selected.add(idx)
+                selected.add(global_idx)
 
             total = len(json.loads(posts_json)) if posts_json else 0
             sel_json = json.dumps(sorted(selected))
@@ -605,6 +641,20 @@ def create_ui():
                 f"**選択: {len(posts)} / {len(posts)} 件** — ダウンロード可能",
             )
 
+        def select_current_page(selected_json, posts_json, current_page):
+            """現在のページの画像をすべて選択に追加"""
+            selected = set(json.loads(selected_json)) if selected_json else set()
+            posts = json.loads(posts_json) if posts_json else []
+            start = current_page * PREVIEW_PER_PAGE
+            end = min(start + PREVIEW_PER_PAGE, len(posts))
+            for i in range(start, end):
+                selected.add(i)
+            sel_json = json.dumps(sorted(selected))
+            info = f"**選択: {len(selected)} / {len(posts)} 件**"
+            if len(selected) > 0:
+                info += " — ダウンロード可能"
+            return sel_json, info
+
         def deselect_all(posts_json):
             """全解除"""
             total = len(json.loads(posts_json)) if posts_json else 0
@@ -612,7 +662,7 @@ def create_ui():
 
         gallery.select(
             fn=on_gallery_select,
-            inputs=[selected_state, posts_state],
+            inputs=[selected_state, posts_state, page_state],
             outputs=[selected_state, selected_info],
         )
 
@@ -622,24 +672,51 @@ def create_ui():
             outputs=[selected_state, selected_info],
         )
 
+        select_page_btn.click(
+            fn=select_current_page,
+            inputs=[selected_state, posts_state, page_state],
+            outputs=[selected_state, selected_info],
+        )
+
         deselect_all_btn.click(
             fn=deselect_all,
             inputs=[posts_state],
             outputs=[selected_state, selected_info],
         )
 
+        # --- ページナビゲーション ---
+        prev_page_btn.click(
+            fn=lambda pj, cp: do_page_change(pj, cp, -1),
+            inputs=[posts_state, page_state],
+            outputs=[gallery, page_state, page_info],
+        )
+
+        next_page_btn.click(
+            fn=lambda pj, cp: do_page_change(pj, cp, +1),
+            inputs=[posts_state, page_state],
+            outputs=[gallery, page_state, page_info],
+        )
+
         # イベント接続
         search_btn.click(
             fn=do_search,
             inputs=[tags_input, max_results, rating_filter, min_score],
-            outputs=[gallery, status_text, posts_state, selected_state, selected_info],
+            outputs=[
+                gallery, status_text, posts_state,
+                selected_state, selected_info,
+                page_state, page_info,
+            ],
         )
 
         # Enter キーでも検索
         tags_input.submit(
             fn=do_search,
             inputs=[tags_input, max_results, rating_filter, min_score],
-            outputs=[gallery, status_text, posts_state, selected_state, selected_info],
+            outputs=[
+                gallery, status_text, posts_state,
+                selected_state, selected_info,
+                page_state, page_info,
+            ],
         )
 
         download_btn.click(
