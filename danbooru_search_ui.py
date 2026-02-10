@@ -289,29 +289,154 @@ def resize_to_sdxl(filepath: Path) -> bool:
 
 
 # ============================================================
-# XMP 埋め込み
+# XMP 埋め込み (exiftool → Python fallback)
 # ============================================================
+def _get_exiftool_path() -> str:
+    """exiftool のパスを返す (PATH or ローカル)"""
+    p = shutil.which("exiftool")
+    if p:
+        return p
+    local = SCRIPT_DIR / "exiftool.exe"
+    if local.exists():
+        return str(local)
+    local2 = SCRIPT_DIR / "exiftool"
+    if local2.exists():
+        return str(local2)
+    return None
+
+
+def _build_xmp_packet(tags_list: list, rating: str, score: int, full_desc: str) -> str:
+    """XMP XML パケットを構築"""
+
+    def esc(s):
+        return (
+            s.replace("&", "&amp;")
+            .replace("<", "&lt;")
+            .replace(">", "&gt;")
+            .replace('"', "&quot;")
+        )
+
+    subject_items = ""
+    for tag in tags_list:
+        subject_items += f"        <rdf:li>{esc(tag)}</rdf:li>\n"
+    subject_items += f"        <rdf:li>rating:{esc(rating)}</rdf:li>\n"
+    subject_items += f"        <rdf:li>score:{score}</rdf:li>\n"
+
+    xmp = f"""<?xpacket begin="\xef\xbb\xbf" id="W5M0MpCehiHzreSzNTczkc9d"?>
+<x:xmpmeta xmlns:x="adobe:ns:meta/">
+  <rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">
+    <rdf:Description
+      xmlns:dc="http://purl.org/dc/elements/1.1/"
+      xmlns:xmp="http://ns.adobe.com/xap/1.0/">
+      <dc:description>
+        <rdf:Alt>
+          <rdf:li xml:lang="x-default">{esc(full_desc)}</rdf:li>
+        </rdf:Alt>
+      </dc:description>
+      <dc:title>
+        <rdf:Alt>
+          <rdf:li xml:lang="x-default">{esc(full_desc)}</rdf:li>
+        </rdf:Alt>
+      </dc:title>
+      <dc:subject>
+        <rdf:Bag>
+{subject_items}        </rdf:Bag>
+      </dc:subject>
+    </rdf:Description>
+  </rdf:RDF>
+</x:xmpmeta>
+<?xpacket end="w"?>"""
+    return xmp
+
+
+def _embed_xmp_to_jpeg(filepath: Path, xmp_packet: str) -> bool:
+    """JPEG に XMP パケットを埋め込む (APP1 マーカー)"""
+    xmp_bytes = xmp_packet.encode("utf-8")
+    xmp_header = b"http://ns.adobe.com/xap/1.0/\x00"
+    app1_data = xmp_header + xmp_bytes
+    app1_length = len(app1_data) + 2
+
+    with open(filepath, "rb") as f:
+        data = f.read()
+
+    if data[:2] != b"\xff\xd8":
+        return False
+
+    pos = 2
+    new_data = b"\xff\xd8"
+    while pos < len(data):
+        if data[pos : pos + 2] == b"\xff\xe1":
+            seg_len = int.from_bytes(data[pos + 2 : pos + 4], "big")
+            seg_body = data[pos + 4 : pos + 2 + seg_len]
+            if seg_body.startswith(b"http://ns.adobe.com/xap/1.0/\x00"):
+                pos += 2 + seg_len
+                continue
+        break
+
+    rest = data[pos:]
+    app1_marker = b"\xff\xe1" + app1_length.to_bytes(2, "big") + app1_data
+    result = b"\xff\xd8" + app1_marker + rest
+
+    with open(filepath, "wb") as f:
+        f.write(result)
+    return True
+
+
+def _embed_xmp_to_png(filepath: Path, xmp_packet: str) -> bool:
+    """PNG に XMP を iTXt チャンクとして埋め込む"""
+    from PIL.PngImagePlugin import PngInfo
+
+    img = Image.open(filepath)
+    meta = PngInfo()
+    meta.add_text("XML:com.adobe.xmp", xmp_packet, zip=False)
+    img.save(filepath, "PNG", pnginfo=meta)
+    return True
+
+
 def embed_xmp(filepath: Path, tags_str: str, rating: str, score: int) -> bool:
-    if not shutil.which("exiftool"):
-        return False
+    """1ファイルに XMP を埋め込む (exiftool優先 → Python fallback)"""
+    tags_list = [t.strip() for t in tags_str.split(",") if t.strip()]
     full_desc = f"{tags_str} rating:{rating} score:{score}"
-    cmd = [
-        "exiftool",
-        "-overwrite_original",
-        f"-XMP:Description={full_desc}",
-        f"-XMP:Title={full_desc}",
-        "-charset",
-        "iptc=UTF8",
-    ]
-    for tag in tags_str.split():
-        cmd.append(f"-XMP:Subject+={tag}")
-    cmd += [f"-XMP:Subject+=rating:{rating}", f"-XMP:Subject+=score:{score}"]
-    cmd.append(str(filepath))
+    ext = filepath.suffix.lower()
+
+    # exiftool があればそれを使う (最も確実)
+    exiftool_path = _get_exiftool_path()
+    if exiftool_path:
+        cmd = [
+            exiftool_path,
+            "-overwrite_original",
+            f"-XMP:Description={full_desc}",
+            f"-XMP:Title={full_desc}",
+            "-charset",
+            "iptc=UTF8",
+        ]
+        for tag in tags_list:
+            cmd.append(f"-XMP:Subject+={tag}")
+        cmd += [f"-XMP:Subject+=rating:{rating}", f"-XMP:Subject+=score:{score}"]
+        cmd.append(str(filepath))
+        try:
+            result = subprocess.run(cmd, capture_output=True, text=True)
+            if "1 image files updated" in result.stdout:
+                return True
+        except:
+            pass
+
+    # exiftool なし or 失敗 → Python で直接埋め込む
+    xmp_packet = _build_xmp_packet(tags_list, rating, score, full_desc)
+
     try:
-        result = subprocess.run(cmd, capture_output=True, text=True)
-        return "1 image files updated" in result.stdout
-    except:
-        return False
+        if ext in (".jpg", ".jpeg"):
+            return _embed_xmp_to_jpeg(filepath, xmp_packet)
+        elif ext == ".png":
+            return _embed_xmp_to_png(filepath, xmp_packet)
+        elif ext == ".webp":
+            xmp_path = filepath.with_suffix(".xmp")
+            xmp_path.write_text(xmp_packet, encoding="utf-8")
+            return True
+    except Exception as e:
+        print(f"  XMP embed error {filepath.name}: {e}")
+
+    return False
 
 
 # ============================================================
@@ -436,6 +561,7 @@ def _make_checkbox_choices(posts, page: int) -> list:
 def _build_page_data(posts, page, selected_indices=None):
     """現在ページの画像パスとチェック状態のリストを返す"""
     import tempfile
+
     preview_dir = Path(tempfile.gettempdir()) / "danbooru_previews"
 
     if selected_indices is None:
@@ -450,7 +576,9 @@ def _build_page_data(posts, page, selected_indices=None):
         pid = p["id"]
         rating = p.get("rating", "?")
         score = p.get("score", 0)
-        ext = (p.get("preview_file_url") or "").rsplit(".", 1)[-1].split("?")[0] or "jpg"
+        ext = (p.get("preview_file_url") or "").rsplit(".", 1)[-1].split("?")[
+            0
+        ] or "jpg"
         local_path = preview_dir / f"{pid}.{ext}"
         img_path = str(local_path) if local_path.exists() else None
         label = f"#{pid} r:{rating} s:{score}"
@@ -490,13 +618,18 @@ def do_search(
     outputs = []
     for img_path, label, checked in page_data:
         outputs.append(gr.update(value=img_path, visible=img_path is not None))
-        outputs.append(gr.update(value=checked, label=label, visible=img_path is not None))
+        outputs.append(
+            gr.update(value=checked, label=label, visible=img_path is not None)
+        )
 
     return [status, posts_json, "[]", sel_info, 0, pg_info] + outputs
 
 
 def do_page_change(
-    posts_json: str, selected_json: str, current_page: int, direction: int,
+    posts_json: str,
+    selected_json: str,
+    current_page: int,
+    direction: int,
     progress=gr.Progress(),
 ):
     """ページ切り替え"""
@@ -525,7 +658,9 @@ def do_page_change(
     outputs = []
     for img_path, label, checked in page_data:
         outputs.append(gr.update(value=img_path, visible=img_path is not None))
-        outputs.append(gr.update(value=checked, label=label, visible=img_path is not None))
+        outputs.append(
+            gr.update(value=checked, label=label, visible=img_path is not None)
+        )
 
     return [new_page, pg_info] + outputs
 
@@ -604,8 +739,8 @@ def create_ui():
 
         # --- 画像カードグリッド (5列×4行 = 20スロット) ---
         # 各スロット: Image + Checkbox
-        image_slots = []   # gr.Image のリスト
-        check_slots = []   # gr.Checkbox のリスト
+        image_slots = []  # gr.Image のリスト
+        check_slots = []  # gr.Checkbox のリスト
 
         for row in range(GRID_ROWS):
             with gr.Row():
@@ -691,7 +826,9 @@ def create_ui():
         )
 
         # --- チェックボックス変更時: 選択状態を反映 ---
-        def on_checkbox_change(slot_idx, checked, selected_json, posts_json, current_page):
+        def on_checkbox_change(
+            slot_idx, checked, selected_json, posts_json, current_page
+        ):
             selected = set(json.loads(selected_json)) if selected_json else set()
             posts = json.loads(posts_json) if posts_json else []
             global_idx = current_page * PREVIEW_PER_PAGE + slot_idx
@@ -708,7 +845,9 @@ def create_ui():
 
         for slot_i, cb in enumerate(check_slots):
             cb.change(
-                fn=lambda checked, sj, pj, cp, _i=slot_i: on_checkbox_change(_i, checked, sj, pj, cp),
+                fn=lambda checked, sj, pj, cp, _i=slot_i: on_checkbox_change(
+                    _i, checked, sj, pj, cp
+                ),
                 inputs=[cb, selected_state, posts_state, page_state],
                 outputs=[selected_state, selected_info],
             )
@@ -747,7 +886,10 @@ def create_ui():
         def select_all_pages(posts_json):
             posts = json.loads(posts_json) if posts_json else []
             all_indices = list(range(len(posts)))
-            return json.dumps(all_indices), f"**選択: {len(posts)} / {len(posts)} 件** — ダウンロード可能"
+            return (
+                json.dumps(all_indices),
+                f"**選択: {len(posts)} / {len(posts)} 件** — ダウンロード可能",
+            )
 
         def deselect_all_pages(posts_json):
             total = len(json.loads(posts_json)) if posts_json else 0
@@ -806,10 +948,14 @@ def create_ui():
             fn=do_search,
             inputs=[tags_input, max_results, rating_filter, min_score],
             outputs=[
-                status_text, posts_state,
-                selected_state, selected_info,
-                page_state, page_info,
-            ] + search_grid_outputs,
+                status_text,
+                posts_state,
+                selected_state,
+                selected_info,
+                page_state,
+                page_info,
+            ]
+            + search_grid_outputs,
         )
 
         # Enter キーでも検索
@@ -817,10 +963,14 @@ def create_ui():
             fn=do_search,
             inputs=[tags_input, max_results, rating_filter, min_score],
             outputs=[
-                status_text, posts_state,
-                selected_state, selected_info,
-                page_state, page_info,
-            ] + search_grid_outputs,
+                status_text,
+                posts_state,
+                selected_state,
+                selected_info,
+                page_state,
+                page_info,
+            ]
+            + search_grid_outputs,
         )
 
         download_btn.click(
