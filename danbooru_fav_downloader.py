@@ -31,7 +31,7 @@ TAGS_QUERY = "ordfav:palm_floods"
 PER_PAGE = 200  # Danbooru API max
 
 SCRIPT_DIR = Path(__file__).parent.resolve()
-OUTPUT_DIR = SCRIPT_DIR / "danbooru_output"
+OUTPUT_DIR = SCRIPT_DIR / "danbooru_output_fav"
 JSON_FILE = OUTPUT_DIR / "_posts_metadata.json"
 
 BASE_URL = "https://danbooru.donmai.us"
