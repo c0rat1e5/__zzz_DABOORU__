@@ -289,8 +289,8 @@ def resize_to_sdxl(filepath: Path) -> bool:
 # ============================================================
 # XMP 埋め込み (Python 内蔵)
 # ============================================================
-def _build_xmp_packet(tags_list: list, rating: str, score: int, full_desc: str) -> str:
-    """XMP XML パケットを構築"""
+def _build_xmp_packet(tags_str: str) -> str:
+    """XMP XML パケットを構築 (dc:description + dc:title のみ)"""
 
     def esc(s):
         return (
@@ -300,32 +300,21 @@ def _build_xmp_packet(tags_list: list, rating: str, score: int, full_desc: str) 
             .replace('"', "&quot;")
         )
 
-    subject_items = ""
-    for tag in tags_list:
-        subject_items += f"        <rdf:li>{esc(tag)}</rdf:li>\n"
-    subject_items += f"        <rdf:li>rating:{esc(rating)}</rdf:li>\n"
-    subject_items += f"        <rdf:li>score:{score}</rdf:li>\n"
-
     xmp = f"""<?xpacket begin="\xef\xbb\xbf" id="W5M0MpCehiHzreSzNTczkc9d"?>
 <x:xmpmeta xmlns:x="adobe:ns:meta/">
   <rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">
     <rdf:Description
-      xmlns:dc="http://purl.org/dc/elements/1.1/"
-      xmlns:xmp="http://ns.adobe.com/xap/1.0/">
+      xmlns:dc="http://purl.org/dc/elements/1.1/">
       <dc:description>
         <rdf:Alt>
-          <rdf:li xml:lang="x-default">{esc(full_desc)}</rdf:li>
+          <rdf:li xml:lang="x-default">{esc(tags_str)}</rdf:li>
         </rdf:Alt>
       </dc:description>
       <dc:title>
         <rdf:Alt>
-          <rdf:li xml:lang="x-default">{esc(full_desc)}</rdf:li>
+          <rdf:li xml:lang="x-default">{esc(tags_str)}</rdf:li>
         </rdf:Alt>
       </dc:title>
-      <dc:subject>
-        <rdf:Bag>
-{subject_items}        </rdf:Bag>
-      </dc:subject>
     </rdf:Description>
   </rdf:RDF>
 </x:xmpmeta>
@@ -418,11 +407,9 @@ def _embed_xmp_to_webp(filepath: Path, xmp_packet: str) -> bool:
     return True
 
 
-def embed_xmp(filepath: Path, tags_str: str, rating: str, score: int) -> bool:
+def embed_xmp(filepath: Path, tags_str: str) -> bool:
     """1ファイルに XMP を埋め込む (Python 内蔵)"""
-    tags_list = [t.strip() for t in tags_str.split(",") if t.strip()]
-    full_desc = f"{tags_str} rating:{rating} score:{score}"
-    xmp_packet = _build_xmp_packet(tags_list, rating, score, full_desc)
+    xmp_packet = _build_xmp_packet(tags_str)
 
     ext = filepath.suffix.lower()
     try:
@@ -502,9 +489,7 @@ def download_selected(
 
         # XMP 埋め込み
         if do_xmp and fp.exists():
-            rating = p.get("rating", "")
-            score = p.get("score", 0)
-            if embed_xmp(fp, tags_str, rating, score):
+            if embed_xmp(fp, tags_str):
                 xmp_count += 1
 
     # JSON メタデータ保存
